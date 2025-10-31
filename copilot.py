@@ -1,109 +1,139 @@
-import os, asyncio, json
-from typing import Optional
+import os
+import re
+import logging
+import asyncio
 import httpx
+
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.constants import ParseMode
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-MCA_URL = os.getenv("MCA_URL", "https://YOUR-ANALYZER.onrender.com")
-RENDER_HOOK_URL = os.getenv("RENDER_HOOK_URL", "")
-BSCSCAN_KEY_FOR_BOT = os.getenv("BSCSCAN_API_KEY", "")
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("mca-copilot")
 
-HELP = (
-    "🤖 meme coin analyser\n"
-    "Send a BSC CA (0x...) to analyze.\n\n"
+MCA_URL = os.getenv("MCA_URL", "").rstrip("/")
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+
+ETH_ADDR_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
+
+HELP_TEXT = (
+    "👋 *Meme Coin Analyser*\n\n"
+    "• Send me a BSC token contract address (starts with `0x`)\n"
+    "• I’ll reply with a summary score.\n\n"
     "Commands:\n"
-    "/start – help\n"
-    "/status – check analyzer + key\n"
-    "/redeploy – trigger Render redeploy\n"
+    "• /status — Check connection to the analyser\n"
+    "• /help — Show this help"
 )
 
-async def fetch_json(method: str, url: str, **kwargs) -> Optional[dict]:
+def nice_pct(v):
+    return "—" if v is None else f"{v:.2f}%"
+
+async def ping_analyzer() -> bool:
+    if not MCA_URL:
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(f"{MCA_URL}/health")
+            return r.status_code == 200 and r.json().get("ok") is True
+    except Exception as e:
+        log.warning("Health check failed: %s", e)
+        return False
+
+async def analyze_address(addr: str) -> dict | None:
     try:
         async with httpx.AsyncClient(timeout=30) as client:
-            r = await client.request(method, url, **kwargs)
-            r.raise_for_status()
-            return r.json()
-    except Exception:
-        return None
-
-def normalize_addr(text: str) -> Optional[str]:
-    t = (text or "").strip()
-    if t.startswith("0x") and len(t) == 42:
-        return t
+            r = await client.post(f"{MCA_URL}/analyze", json={"chain": "bsc", "address": addr})
+            if r.status_code == 200:
+                return r.json()
+            log.warning("Analyzer error %s: %s", r.status_code, r.text)
+    except Exception as e:
+        log.exception("Analyze call failed: %s", e)
     return None
 
-def format_result(data: dict) -> str:
-    liq = data.get("liquidity", {}) or {}
-    sup = data.get("supply", {}) or {}
-    fxs = data.get("factors", []) or []
-    own = next((f for f in fxs if f.get("id") == "ownership"), None)
-    mkt = next((f for f in fxs if f.get("id") == "market_integrity"), None)
-    own_ev = (own or {}).get("evidence") or []
-    mkt_ev = (mkt or {}).get("evidence") or []
-    lines = [
-        f"**MCA Result**  Score: {data.get('score')}  Band: {data.get('band')}",
-        f"DEX: {liq.get('dex') or 'n/a'}",
-        f"Pair/Pool: {liq.get('pair')}",
-        f"LP Lock: {liq.get('lp_locked_pct') or 0}% via {liq.get('locker') or 'n/a'}",
-        f"Supply: {sup.get('total') or 'n/a'}  Dead%: {sup.get('dead_wallet_pct') or 'n/a'}  Top10%: {sup.get('top10_pct') or 'n/a'}",
-        f"Ownership: {(own_ev or ['unknown'])[0]}",
-    ]
-    if mkt_ev:
-        lines.append("Market: " + "; ".join(mkt_ev))
-    return "\n".join(lines)
+# Handlers
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(HELP_TEXT, parse_mode=ParseMode.MARKDOWN)
 
-async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(HELP)
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(HELP_TEXT, parse_mode=ParseMode.MARKDOWN)
 
-async def status_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    health = await fetch_json("GET", f"{MCA_URL}/health")
-    ok = (health or {}).get("ok") is True
-    dbg = await fetch_json("GET", f"{MCA_URL}/debug/bscscan?address=0x0000000000000000000000000000000000000000")
-    abi_state = (dbg or {}).get("abi_status", "unknown")
-    key_present = (dbg or {}).get("key_present", False)
-    msg = [
-        f"Analyzer reachable: {ok}",
-        f"Analyzer ABI status: {abi_state}",
-        f"Analyzer BSCSCAN_API_KEY present: {key_present}",
-        f"Bot has BSCSCAN_API_KEY: {bool(BSCSCAN_KEY_FOR_BOT)}",
-        f"MCA_URL: {MCA_URL}",
-    ]
-    await update.message.reply_text("\n".join(msg))
+async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ok = await ping_analyzer()
+    if ok:
+        await update.message.reply_text("✅ Analyzer online")
+    else:
+        await update.message.reply_text("❌ Analyzer not reachable. Check MCA_URL on Railway.")
 
-async def redeploy_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not RENDER_HOOK_URL:
-        return await update.message.reply_text("❌ RENDER_HOOK_URL not set.")
-    await update.message.reply_text("🔁 Triggering Render redeploy...")
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            r = await client.post(RENDER_HOOK_URL, json={})
-            ok = r.status_code in (200, 201, 202)
-    except Exception:
-        ok = False
-    await update.message.reply_text("✅ Deploy hook called." if ok else "❌ Failed to call deploy hook.")
-
-async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
+async def address_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    if not ETH_ADDR_RE.fullmatch(text):
+        await update.message.reply_text("Please send a *BSC token address* (format: `0x...40 hex chars`).", parse_mode=ParseMode.MARKDOWN)
         return
-    addr = normalize_addr(update.message.text)
-    if not addr:
-        return await update.message.reply_text("Please send a valid BSC contract address (0x...)")
-    payload = {"chain": "bsc", "address": addr}
-    data = await fetch_json("POST", f"{MCA_URL}/analyze", json=payload)
-    if not data:
-        return await update.message.reply_text("❌ Couldn’t reach analyzer. Use /status to check.")
-    await update.message.reply_text(format_result(data), disable_web_page_preview=True)
 
-def main():
-    if not TELEGRAM_BOT_TOKEN:
-        raise SystemExit("Missing TELEGRAM_BOT_TOKEN")
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    await update.message.reply_text("⏳ Analyzing…")
+    data = await analyze_address(text)
+    if not data:
+        await update.message.reply_text("❌ Sorry, couldn’t analyze. Check logs or try again.")
+        return
+
+    token = data.get("token", {})
+    liq = data.get("liquidity", {}) or {}
+    supply = data.get("supply", {}) or {}
+    factors = data.get("factors", []) or []
+
+    lines = [
+        f"*{token.get('name','?')}* ({token.get('symbol','?')})",
+        f"`{token.get('address','?')}`",
+        "",
+        f"*Score:* {data.get('score','?')}  •  *Band:* {data.get('band','?')}",
+        "",
+        "*Key factors:*"
+    ]
+    for f in factors[:5]:
+        impact = f.get("impact", 0)
+        emoji = "🟢" if impact > 0 else ("🔴" if impact < 0 else "⚪")
+        ev = "; ".join(f.get("evidence", [])[:1]) or ""
+        lines.append(f"{emoji} {f.get('id','?')} — {ev}")
+
+    if liq:
+        lines += [
+            "",
+            "*Liquidity:*",
+            f"DEX: {liq.get('dex','?')}",
+            f"Pair: `{liq.get('pair','—')}`",
+            f"LP locked: {liq.get('lp_locked_pct', 0)}% via {liq.get('locker','—')}",
+        ]
+    if supply:
+        lines += [
+            "",
+            "*Supply:*",
+            f"Total: {supply.get('total','—')}",
+            f"Dead wallet: {nice_pct(supply.get('dead_wallet_pct'))}",
+            f"Top10: {nice_pct(supply.get('top10_pct'))}",
+        ]
+
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+
+async def main():
+    if not TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN missing")
+    app = Application.builder().token(TOKEN).build()
+
     app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
-    app.add_handler(CommandHandler("redeploy", redeploy_cmd))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
-    app.run_polling()
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, address_msg))
+
+    log.info("Bot starting…")
+    await app.initialize()
+    await app.start()
+    log.info("Bot started ✅")
+    await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+    # Keep running forever
+    await asyncio.Event().wait()
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
